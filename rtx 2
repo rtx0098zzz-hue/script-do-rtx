@@ -1,0 +1,903 @@
+--[[
+    ═══════════════════════════════════════════════════════════
+    ⚔️  FARM & RAID SYSTEM - UI + Lógica Completa
+    ═══════════════════════════════════════════════════════════
+    - Janela arrastável
+    - Abas: Farm | Raid | Ilhas | Configurações
+    - Botões com animação de hover e click
+    - Status em tempo real
+    - Sistema de Farm com pathfinding
+    - Sistema de Raid com progresso
+    - STOP ALL sempre visível
+    - Modular internamente, arquivo único
+
+    Tecla P = mostrar/ocultar janela
+]]
+
+-- ═══════════════════════════════════════════════
+-- SERVIÇOS
+-- ═══════════════════════════════════════════════
+local Players           = game:GetService("Players")
+local TweenService      = game:GetService("TweenService")
+local UserInputService  = game:GetService("UserInputService")
+local RunService        = game:GetService("RunService")
+local PathfindingService= game:GetService("PathfindingService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
+
+-- ═══════════════════════════════════════════════
+-- CONFIGURAÇÕES GLOBAIS
+-- ═══════════════════════════════════════════════
+local Config = {
+    UI = {
+        Title            = "⚔  FARM & RAID SYSTEM",
+        Width            = 560,
+        Height           = 460,
+        Background       = Color3.fromRGB(18, 18, 24),
+        Surface          = Color3.fromRGB(26, 26, 36),
+        SurfaceLight     = Color3.fromRGB(36, 36, 48),
+        Primary          = Color3.fromRGB(88, 101, 242),
+        PrimaryHover     = Color3.fromRGB(110, 122, 250),
+        Success          = Color3.fromRGB(87, 242, 135),
+        Warning          = Color3.fromRGB(254, 231, 92),
+        Danger           = Color3.fromRGB(237, 66, 69),
+        Text             = Color3.fromRGB(240, 240, 250),
+        TextMuted        = Color3.fromRGB(150, 150, 170),
+        Border           = Color3.fromRGB(50, 50, 68),
+    },
+    Fonts = {
+        Bold    = Enum.Font.GothamBold,
+        Medium  = Enum.Font.GothamMedium,
+        Regular = Enum.Font.Gotham,
+    },
+    Farm = {
+        RadiusSearch     = 150,
+        AttackRange      = 8,
+        AttackCooldown   = 0.35,
+        PathRecalcTime   = 1.5,
+        MaxIterations    = 5000,
+        NpcFolderName    = nil,          -- ex: "NPCs" — nil = escaneia workspace
+        NpcAttribute     = "IsNPC",      -- atributo que marca NPCs válidos
+        NpcNameContains  = nil,          -- ex: "Bandit" — nil = qualquer nome
+        Blacklist        = { "Dummy", "Practice" },
+        Whitelist        = {},
+    },
+    Raid = {
+        NpcFolderName    = "RaidNPCs",   -- pasta com NPCs de raid
+        AreaFolderName   = "RaidAreas",  -- pasta com áreas de raid
+        AttackRange      = 8,
+        AttackCooldown   = 0.35,
+    },
+    AirFarm = {
+        Height           = 35,
+        EnabledByDefault = false,
+    },
+}
+
+-- ═══════════════════════════════════════════════
+-- UTILITÁRIOS
+-- ═══════════════════════════════════════════════
+local Utils = {}
+
+function Utils.create(className, props)
+    local inst = Instance.new(className)
+    for k, v in pairs(props) do
+        if k ~= "Parent" then inst[k] = v end
+    end
+    if props.Parent then inst.Parent = props.Parent end
+    return inst
+end
+
+function Utils.tween(inst, dur, goal)
+    local t = TweenService:Create(
+        inst,
+        TweenInfo.new(dur or 0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+        goal
+    )
+    t:Play()
+    return t
+end
+
+function Utils.corner(parent, radius)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, radius or 8)
+    c.Parent = parent
+    return c
+end
+
+function Utils.stroke(parent, color, thickness, transparency)
+    local s = Instance.new("UIStroke")
+    s.Color = color or Config.UI.Border
+    s.Thickness = thickness or 1
+    s.Transparency = transparency or 0.3
+    s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    s.Parent = parent
+    return s
+end
+
+function Utils.padding(parent, px)
+    local p = Instance.new("UIPadding")
+    p.PaddingTop = UDim.new(0, px)
+    p.PaddingBottom = UDim.new(0, px)
+    p.PaddingLeft = UDim.new(0, px)
+    p.PaddingRight = UDim.new(0, px)
+    p.Parent = parent
+    return p
+end
+
+function Utils.distance(a, b)
+    if typeof(a) == "Instance" then a = a.Position end
+    if typeof(b) == "Instance" then b = b.Position end
+    return (a - b).Magnitude
+end
+
+function Utils.getHumanoid(model)
+    if not model or not model:IsA("Model") then return nil end
+    return model:FindFirstChildOfClass("Humanoid")
+end
+
+function Utils.getRoot(model)
+    if not model then return nil end
+    return model:FindFirstChild("HumanoidRootPart")
+end
+
+function Utils.isAlive(model)
+    local hum = Utils.getHumanoid(model)
+    return hum and hum.Health > 0
+end
+
+-- ═══════════════════════════════════════════════
+-- ESTADO GLOBAL
+-- ═══════════════════════════════════════════════
+local State = {
+    FarmActive       = false,
+    AirFarmActive    = Config.AirFarm.EnabledByDefault,
+    RaidActive       = false,
+    AutoCollect      = false,
+    AutoSell         = false,
+    CurrentIsland    = "—",
+    CurrentTarget    = "—",
+    AllowedIslands   = {},
+    IslandSequence   = {},
+    SequenceIndex    = 0,
+    RaidProgress     = 0,
+    RaidTotal        = 0,
+    Log              = {},
+}
+
+-- ═══════════════════════════════════════════════
+-- LISTA DE ILHAS (ajuste conforme seu jogo)
+-- ═══════════════════════════════════════════════
+local Islands = {
+    "Ilha Inicial",
+    "Ilha do Deserto",
+    "Ilha Vulcânica",
+    "Ilha Celestial",
+    "Ilha Sombria",
+}
+
+-- ═══════════════════════════════════════════════
+-- BUSCA DE NPCs
+-- ═══════════════════════════════════════════════
+local NpcFinder = {}
+
+function NpcFinder.scanContainer(container, originPos, radius, results)
+    for _, obj in ipairs(container:GetDescendants()) do
+        if not obj:IsA("Model") then continue end
+        if obj == LocalPlayer.Character then continue end
+        if Players:GetPlayerFromCharacter(obj) then continue end
+
+        local hum = Utils.getHumanoid(obj)
+        local root = Utils.getRoot(obj)
+        if not hum or not root or hum.Health <= 0 then continue end
+
+        -- Filtro por atributo
+        if Config.Farm.NpcAttribute and obj:GetAttribute(Config.Farm.NpcAttribute) == false then
+            continue
+        end
+
+        -- Filtro por nome
+        local name = obj.Name
+        local blocked = false
+        for _, b in ipairs(Config.Farm.Blacklist) do
+            if name:lower():find(b:lower(), 1, true) then blocked = true break end
+        end
+        if blocked then continue end
+
+        if #Config.Farm.Whitelist > 0 then
+            local ok = false
+            for _, w in ipairs(Config.Farm.Whitelist) do
+                if name:lower():find(w:lower(), 1, true) then ok = true break end
+            end
+            if not ok then continue end
+        end
+
+        if Config.Farm.NpcNameContains then
+            if not name:lower():find(Config.Farm.NpcNameContains:lower(), 1, true) then
+                continue
+            end
+        end
+
+        local d = Utils.distance(originPos, root.Position)
+        if d <= radius then
+            table.insert(results, { model = obj, distance = d })
+        end
+    end
+end
+
+function NpcFinder.findNearest(originPos, radius)
+    local results = {}
+    if Config.Farm.NpcFolderName then
+        local folder = workspace:FindFirstChild(Config.Farm.NpcFolderName, true)
+        if folder then
+            NpcFinder.scanContainer(folder, originPos, radius, results)
+        end
+    else
+        NpcFinder.scanContainer(workspace, originPos, radius, results)
+    end
+    table.sort(results, function(a, b) return a.distance < b.distance end)
+    return results[1] and results[1].model or nil
+end
+
+-- ═══════════════════════════════════════════════
+-- MOVIMENTO (usa Humanoid:MoveTo — mecânica natural)
+-- ═══════════════════════════════════════════════
+local Movement = {}
+
+function Movement.moveTo(position)
+    local char = LocalPlayer.Character
+    if not char then return false end
+    local hum = Utils.getHumanoid(char)
+    if not hum or hum.Health <= 0 then return false end
+
+    -- Tenta pathfinding para desviar de obstáculos
+    local ok, path = pcall(function()
+        local p = PathfindingService:CreatePath({
+            AgentRadius = 2,
+            AgentHeight = 5,
+            AgentCanJump = true,
+        })
+        p:ComputeAsync(char.HumanoidRootPart.Position, position)
+        return p
+    end)
+
+    if ok and path and path.Status == Enum.PathStatus.Success then
+        for _, wp in ipairs(path:GetWaypoints()) do
+            if not State.FarmActive and not State.RaidActive then return false end
+            if wp.Action == Enum.PathWaypointAction.Jump then
+                hum.Jump = true
+            end
+            hum:MoveTo(wp.Position)
+            local reached = hum.MoveToFinished:Wait()
+            if not reached then break end
+        end
+    else
+        hum:MoveTo(position)
+    end
+    return true
+end
+
+-- ═══════════════════════════════════════════════
+-- ATAQUE (usa ferramenta equipada — mecânica natural)
+-- ═══════════════════════════════════════════════
+local Combat = {}
+
+function Combat.attack(target)
+    local char = LocalPlayer.Character
+    if not char then return end
+    local tool = char:FindFirstChildOfClass("Tool")
+    if tool then
+        pcall(function() tool:Activate() end)
+    else
+        -- Fallback: eventos padrão de clique
+        local mouse = LocalPlayer:GetMouse()
+        if mouse and target then
+            local targetPart = Utils.getRoot(target)
+            if targetPart then
+                mouse.Hit = targetPart.CFrame
+            end
+        end
+    end
+end
+
+function Combat.faceTarget(target)
+    local char = LocalPlayer.Character
+    if not char then return end
+    local root = Utils.getRoot(char)
+    local tRoot = Utils.getRoot(target)
+    if root and tRoot then
+        local dir = (tRoot.Position - root.Position)
+        dir = Vector3.new(dir.X, 0, dir.Z)
+        if dir.Magnitude > 0.1 then
+            root.CFrame = CFrame.new(root.Position, root.Position + dir)
+        end
+    end
+end
+
+-- ═══════════════════════════════════════════════
+-- SISTEMA DE FARM
+-- ═══════════════════════════════════════════════
+local FarmSystem = {}
+FarmSystem.__index = FarmSystem
+
+function FarmSystem.new(bus)
+    local self = setmetatable({}, FarmSystem)
+    self.bus = bus
+    self.currentTarget = nil
+    self.thread = nil
+    self.iterations = 0
+    return self
+end
+
+function FarmSystem:getCharacter()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    local hum = Utils.getHumanoid(char)
+    if not hum or hum.Health <= 0 then return nil end
+    return char, hum
+end
+
+function FarmSystem:airFarmTick()
+    if not State.AirFarmActive then return end
+    local char, hum = self:getCharacter()
+    if not char then return end
+    local root = Utils.getRoot(char)
+    if not root then return end
+
+    -- Mantém altura usando salto (mecânica padrão)
+    local ray = Ray.new(root.Position, Vector3.new(0, -(Config.AirFarm.Height + 8), 0))
+    local hit, pos = workspace:FindPartOnRay(ray, char)
+    if hit and (root.Position.Y - pos.Y) < Config.AirFarm.Height then
+        hum.Jump = true
+    end
+end
+
+function FarmSystem:loop()
+    while State.FarmActive and self.iterations < Config.Farm.MaxIterations do
+        self.iterations += 1
+
+        local char, hum = self:getCharacter()
+        if not char then
+            self.bus:setStatus("Personagem morto — aguardando", Config.UI.Warning)
+            task.wait(1)
+            continue
+        end
+
+        local root = Utils.getRoot(char)
+
+        -- Se alvo morreu ou não existe, procura novo
+        if not Utils.isAlive(self.currentTarget) then
+            self.currentTarget = nil
+            State.CurrentTarget = "—"
+            self.bus:setStatus("Farmando — buscando NPC", Config.UI.Primary)
+            self.bus:setTarget("—")
+
+            self.currentTarget = NpcFinder.findNearest(root.Position, Config.Farm.RadiusSearch)
+
+            if not self.currentTarget then
+                self.bus:setStatus("Farmando — nenhum NPC próximo", Config.UI.Warning)
+                task.wait(1)
+                continue
+            end
+
+            State.CurrentTarget = self.currentTarget.Name
+            self.bus:setTarget(self.currentTarget.Name)
+        end
+
+        if not self.currentTarget then
+            task.wait(0.5)
+            continue
+        end
+
+        local tRoot = Utils.getRoot(self.currentTarget)
+        if not tRoot then
+            self.currentTarget = nil
+            continue
+        end
+
+        local dist = Utils.distance(root.Position, tRoot.Position)
+
+        if dist > Config.Farm.AttackRange then
+            self.bus:setStatus("Farmando — indo até " .. self.currentTarget.Name, Config.UI.Primary)
+            if not Movement.moveTo(tRoot.Position) then
+                task.wait(0.1)
+            end
+        else
+            self.bus:setStatus("Derrotando NPC", Config.UI.Danger)
+            Combat.faceTarget(self.currentTarget)
+            Combat.attack(self.currentTarget)
+            if State.AirFarmActive then self:airFarmTick() end
+        end
+
+        task.wait(Config.Farm.AttackCooldown)
+    end
+
+    -- Final do loop
+    if self.iterations >= Config.Farm.MaxIterations then
+        self.bus:setStatus("Farm — limite de segurança atingido", Config.UI.Warning)
+        State.FarmActive = false
+    end
+end
+
+function FarmSystem:start()
+    if State.FarmActive then return end
+    State.FarmActive = true
+    self.iterations = 0
+    self.bus:setStatus("Farmando", Config.UI.Success)
+    self.thread = task.spawn(function() self:loop() end)
+end
+
+function FarmSystem:stop()
+    State.FarmActive = false
+    self.currentTarget = nil
+    State.CurrentTarget = "—"
+    self.bus:setTarget("—")
+    self.bus:setStatus("Aguardando", Config.UI.TextMuted)
+end
+
+-- ═══════════════════════════════════════════════
+-- SISTEMA DE RAID
+-- ═══════════════════════════════════════════════
+local RaidSystem = {}
+RaidSystem.__index = RaidSystem
+
+function RaidSystem.new(bus)
+    local self = setmetatable({}, RaidSystem)
+    self.bus = bus
+    self.currentNpc = nil
+    self.iterations = 0
+    return self
+end
+
+function RaidSystem:getCharacter()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    local hum = Utils.getHumanoid(char)
+    if not hum or hum.Health <= 0 then return nil end
+    return char, hum
+end
+
+function RaidSystem:getRaidNpcs()
+    local list = {}
+    local folder = workspace:FindFirstChild(Config.Raid.NpcFolderName, true)
+    local container = folder or workspace
+    for _, obj in ipairs(container:GetDescendants()) do
+        if not obj:IsA("Model") then continue end
+        if Players:GetPlayerFromCharacter(obj) then continue end
+        if not Utils.isAlive(obj) then continue end
+        if not Utils.getRoot(obj) then continue end
+        table.insert(list, obj)
+    end
+    return list
+end
+
+function RaidSystem:getNextArea()
+    local areasFolder = workspace:FindFirstChild(Config.Raid.AreaFolderName, true)
+    if not areasFolder then return nil end
+    for _, area in ipairs(areasFolder:GetChildren()) do
+        if area:IsA("BasePart") then
+            return area.Position
+        end
+    end
+    return nil
+end
+
+function RaidSystem:loop()
+    State.RaidProgress = 0
+    State.RaidTotal = 0
+    self.bus:setStatus("Indo para ilha da raid", Config.UI.Warning)
+
+    task.wait(1)
+
+    while State.RaidActive and self.iterations < Config.Farm.MaxIterations do
+        self.iterations += 1
+
+        local char, hum = self:getCharacter()
+        if not char then
+            task.wait(1)
+            continue
+        end
+        local root = Utils.getRoot(char)
+
+        -- Se alvo inválido, busca novo
+        if not Utils.isAlive(self.currentNpc) then
+            self.currentNpc = nil
+
+            local npcs = self:getRaidNpcs()
+            State.RaidTotal = #npcs
+
+            if #npcs == 0 then
+                -- Tenta próxima área
+                local nextArea = self:getNextArea()
+                if nextArea then
+                    self.bus:setStatus("Indo para próxima área", Config.UI.Warning)
+                    Movement.moveTo(nextArea)
+                    task.wait(1)
+                    -- Recheca; se continuar vazio após N tentativas, encerra
+                    local retry = self:getRaidNpcs()
+                    if #retry == 0 then
+                        self.bus:setStatus("Raid concluída", Config.UI.Success)
+                        self.bus:setProgress(State.RaidProgress, State.RaidProgress)
+                        State.RaidActive = false
+                        return
+                    end
+                else
+                    self.bus:setStatus("Raid concluída", Config.UI.Success)
+                    self.bus:setProgress(State.RaidProgress, State.RaidProgress)
+                    State.RaidActive = false
+                    return
+                end
+            else
+                -- Ordena por distância
+                table.sort(npcs, function(a, b)
+                    local ra, rb = Utils.getRoot(a), Utils.getRoot(b)
+                    if not ra or not rb then return false end
+                    return Utils.distance(root.Position, ra.Position)
+                         < Utils.distance(root.Position, rb.Position)
+                end)
+                self.currentNpc = npcs[1]
+                State.CurrentTarget = self.currentNpc.Name
+                self.bus:setTarget(self.currentNpc.Name)
+            end
+        end
+
+        if self.currentNpc then
+            local tRoot = Utils.getRoot(self.currentNpc)
+            if tRoot then
+                local dist = Utils.distance(root.Position, tRoot.Position)
+                if dist > Config.Raid.AttackRange then
+                    self.bus:setStatus("Raid em andamento — indo até alvo", Config.UI.Primary)
+                    Movement.moveTo(tRoot.Position)
+                else
+                    self.bus:setStatus("Raid em andamento", Config.UI.Danger)
+                    Combat.faceTarget(self.currentNpc)
+                    Combat.attack(self.currentNpc)
+
+                    -- Detecta morte
+                    local hum2 = Utils.getHumanoid(self.currentNpc)
+                    if not hum2 or hum2.Health <= 0 then
+                        State.RaidProgress += 1
+                        self.bus:setProgress(State.RaidProgress, State.RaidTotal)
+                        self.currentNpc = nil
+                    end
+                end
+            else
+                self.currentNpc = nil
+            end
+        end
+
+        task.wait(Config.Raid.AttackCooldown)
+    end
+
+    if self.iterations >= Config.Farm.MaxIterations then
+        self.bus:setStatus("Raid — limite de segurança", Config.UI.Warning)
+        State.RaidActive = false
+    end
+end
+
+function RaidSystem:start(islandName)
+    if State.RaidActive then return end
+    State.RaidActive = true
+    self.iterations = 0
+    State.CurrentIsland = islandName or State.CurrentIsland
+    self.bus:setIsland(State.CurrentIsland)
+    self.bus:setStatus("Raid em andamento", Config.UI.Success)
+    task.spawn(function() self:loop() end)
+end
+
+function RaidSystem:stop()
+    State.RaidActive = false
+    self.currentNpc = nil
+    State.CurrentTarget = "—"
+    self.bus:setTarget("—")
+    self.bus:setStatus("Raid parada", Config.UI.TextMuted)
+end
+
+-- ═══════════════════════════════════════════════
+-- BUS DE EVENTOS (ponte UI <-> Lógica)
+-- ═══════════════════════════════════════════════
+local Bus = {}
+Bus.__index = Bus
+
+function Bus.new()
+    local self = setmetatable({}, Bus)
+    self.ui = nil
+    return self
+end
+
+function Bus:attachUI(ui)
+    self.ui = ui
+end
+
+function Bus:setStatus(text, color)
+    if self.ui then self.ui:setStatus(text, color) end
+end
+
+function Bus:setIsland(name)
+    State.CurrentIsland = name
+    if self.ui then self.ui:setInfo(name, State.CurrentTarget) end
+end
+
+function Bus:setTarget(name)
+    State.CurrentTarget = name
+    if self.ui then self.ui:setInfo(State.CurrentIsland, name) end
+end
+
+function Bus:setProgress(done, total)
+    if self.ui then self.ui:setProgress(done, total) end
+end
+
+local bus = Bus.new()
+
+-- ═══════════════════════════════════════════════
+-- UI - CONSTRUÇÃO
+-- ═══════════════════════════════════════════════
+local UI = {}
+UI.__index = UI
+
+local C = Config.UI
+local F = Config.Fonts
+
+-- ─── Helpers de UI ───
+local function makeButton(parent, text, color, width, height)
+    local btn = Utils.create("TextButton", {
+        Size = UDim2.new(0, width or 130, 0, height or 36),
+        BackgroundColor3 = color or C.Primary,
+        Text = text,
+        TextColor3 = C.Text,
+        Font = F.Bold,
+        TextSize = 14,
+        AutoButtonColor = false,
+        BorderSizePixel = 0,
+        Parent = parent,
+    })
+    Utils.corner(btn, 8)
+    Utils.stroke(btn, Color3.new(1, 1, 1), 1, 0.85)
+
+    local base = btn.BackgroundColor3
+    btn.MouseEnter:Connect(function()
+        Utils.tween(btn, 0.15, { BackgroundColor3 = base:Lerp(Color3.new(1, 1, 1), 0.15) })
+    end)
+    btn.MouseLeave:Connect(function()
+        Utils.tween(btn, 0.15, { BackgroundColor3 = base })
+    end)
+    btn.MouseButton1Down:Connect(function()
+        Utils.tween(btn, 0.08, { BackgroundColor3 = base:Lerp(Color3.new(0, 0, 0), 0.25) })
+    end)
+    btn.MouseButton1Up:Connect(function()
+        Utils.tween(btn, 0.12, { BackgroundColor3 = base })
+    end)
+    return btn
+end
+
+function UI.new()
+    local self = setmetatable({}, UI)
+    self.tabs = {}
+    self.pages = {}
+    self.toggles = {}
+
+    -- ScreenGui
+    local gui = Utils.create("ScreenGui", {
+        Name = "FarmRaidUI",
+        ResetOnSpawn = false,
+        ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+        Parent = PlayerGui,
+    })
+    self.gui = gui
+
+    -- ─── Janela Principal ───
+    local main = Utils.create("Frame", {
+        Name = "Main",
+        Size = UDim2.new(0, C.Width, 0, C.Height),
+        Position = UDim2.new(0.5, -C.Width / 2, 0.5, -C.Height / 2),
+        BackgroundColor3 = C.Background,
+        BorderSizePixel = 0,
+        Active = true,
+        Parent = gui,
+    })
+    Utils.corner(main, 14)
+    Utils.stroke(main, C.Border, 1, 0.2)
+    self.main = main
+
+    -- ─── Header ───
+    local header = Utils.create("Frame", {
+        Size = UDim2.new(1, 0, 0, 52),
+        BackgroundColor3 = C.Surface,
+        BorderSizePixel = 0,
+        Parent = main,
+    })
+    Utils.corner(header, 14)
+    Utils.create("Frame", {
+        Size = UDim2.new(1, 0, 0, 14),
+        Position = UDim2.new(0, 0, 1, -14),
+        BackgroundColor3 = C.Surface,
+        BorderSizePixel = 0,
+        Parent = header,
+    })
+
+    -- Ícone
+    local iconBox = Utils.create("Frame", {
+        Size = UDim2.new(0, 30, 0, 30),
+        Position = UDim2.new(0, 16, 0.5, -15),
+        BackgroundColor3 = C.Primary,
+        BorderSizePixel = 0,
+        Parent = header,
+    })
+    Utils.corner(iconBox, 8)
+    Utils.create("TextLabel", {
+        Size = UDim2.new(1, 0, 1, 0),
+        BackgroundTransparency = 1,
+        Text = "⚔",
+        TextColor3 = C.Text,
+        TextSize = 18,
+        Font = F.Bold,
+        Parent = iconBox,
+    })
+
+    Utils.create("TextLabel", {
+        Size = UDim2.new(0, 300, 1, 0),
+        Position = UDim2.new(0, 56, 0, 0),
+        BackgroundTransparency = 1,
+        Text = C.Title,
+        TextColor3 = C.Text,
+        TextSize = 15,
+        Font = F.Bold,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = header,
+    })
+
+    -- Botões do header
+    local minBtn = makeButton(header, "—", C.SurfaceLight, 30, 30)
+    minBtn.Position = UDim2.new(1, -78, 0.5, -15)
+
+    local closeBtn = makeButton(header, "✕", C.SurfaceLight, 30, 30)
+    closeBtn.Position = UDim2.new(1, -42, 0.5, -15)
+
+    closeBtn.MouseButton1Click:Connect(function()
+        Utils.tween(main, 0.2, { Size = UDim2.new(0, 0, 0, 0) })
+        task.wait(0.2)
+        gui.Enabled = false
+    end)
+
+    local minimized = false
+    minBtn.MouseButton1Click:Connect(function()
+        minimized = not minimized
+        local h = minimized and 52 or C.Height
+        Utils.tween(main, 0.25, { Size = UDim2.new(0, C.Width, 0, h) })
+        statusBar.Visible = not minimized
+        tabBar.Visible = not minimized
+        contentFrame.Visible = not minimized
+        stopAllBtn.Visible = not minimized
+        minBtn.Text = minimized and "+" or "—"
+    end)
+
+    -- ─── Sistema de arrastar ───
+    local dragging, dragStart, startPos
+    header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = main.Position
+        end
+    end)
+    header.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            main.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+
+    -- ─── Barra de status ───
+    local statusBar = Utils.create("Frame", {
+        Name = "StatusBar",
+        Size = UDim2.new(1, -24, 0, 56),
+        Position = UDim2.new(0, 12, 0, 62),
+        BackgroundColor3 = C.Surface,
+        BorderSizePixel = 0,
+        Parent = main,
+    })
+    Utils.corner(statusBar, 10)
+    Utils.stroke(statusBar, C.Border, 1, 0.4)
+
+    local dot = Utils.create("Frame", {
+        Size = UDim2.new(0, 10, 0, 10),
+        Position = UDim2.new(0, 16, 0, 14),
+        BackgroundColor3 = C.TextMuted,
+        BorderSizePixel = 0,
+        Parent = statusBar,
+    })
+    Utils.corner(dot, 5)
+    self.statusDot = dot
+
+    local statusLbl = Utils.create("TextLabel", {
+        Size = UDim2.new(1, -40, 0, 20),
+        Position = UDim2.new(0, 36, 0, 8),
+        BackgroundTransparency = 1,
+        Text = "Status: Aguardando",
+        TextColor3 = C.Text,
+        TextSize = 13,
+        Font = F.Medium,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = statusBar,
+    })
+    self.statusLabel = statusLbl
+
+    local infoLbl = Utils.create("TextLabel", {
+        Size = UDim2.new(1, -40, 0, 18),
+        Position = UDim2.new(0, 36, 0, 28),
+        BackgroundTransparency = 1,
+        Text = "🏝 —   |   🎯 —",
+        TextColor3 = C.TextMuted,
+        TextSize = 12,
+        Font = F.Regular,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = statusBar,
+    })
+    self.infoLabel = infoLbl
+
+    -- ─── Abas ───
+    local tabBar = Utils.create("Frame", {
+        Name = "TabBar",
+        Size = UDim2.new(1, -24, 0, 38),
+        Position = UDim2.new(0, 12, 0, 126),
+        BackgroundColor3 = C.Surface,
+        BorderSizePixel = 0,
+        Parent = main,
+    })
+    Utils.corner(tabBar, 10)
+    Utils.create("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        HorizontalAlignment = Enum.HorizontalAlignment.Center,
+        VerticalAlignment = Enum.VerticalAlignment.Center,
+        Padding = UDim.new(0, 4),
+        Parent = tabBar,
+    })
+    Utils.padding(tabBar, 4)
+
+    -- ─── Área de conteúdo ───
+    local contentFrame = Utils.create("Frame", {
+        Name = "Content",
+        Size = UDim2.new(1, -24, 1, -230),
+        Position = UDim2.new(0, 12, 0, 172),
+        BackgroundColor3 = C.Surface,
+        BorderSizePixel = 0,
+        ClipsDescendants = true,
+        Parent = main,
+    })
+    Utils.corner(contentFrame, 10)
+    Utils.stroke(contentFrame, C.Border, 1, 0.4)
+    self.contentFrame = contentFrame
+
+    -- ─── Cria abas ───
+    local tabNames = { "Farm", "Raid", "Ilhas", "Configurações" }
+    for i, name in ipairs(tabNames) do
+        local btn = Utils.create("TextButton", {
+            Name = name .. "Tab",
+            Size = UDim2.new(0.25, -4, 1, 0),
+            BackgroundColor3 = C.Surface,
+            Text = name,
+            TextColor3 = C.TextMuted,
+            TextSize = 13,
+            Font = F.Medium,
+            AutoButtonColor = false,
+            BorderSizePixel = 0,
+            Parent = tabBar,
+        })
+        Utils.corner(btn, 8)
+
+        local page = Utils.create("ScrollingFrame", {
+            Name = name .. "Page",
+            Size = UDim2.new(1, 0, 1, 0),
+            BackgroundTransparency = 1
